@@ -78,7 +78,6 @@
 -include("webmachine_logger.hrl").
 -include("wm_reqstate.hrl").
 -include("wm_reqdata.hrl").
--include_lib("mochiweb/include/internal.hrl").
 
 -define(WMVSN, "1.9.0").
 -define(QUIP, "someone had painted it blue").
@@ -682,7 +681,10 @@ make_headers(Code, Length, RD) ->
                       mochiweb_headers:make(wrq:resp_headers(RD)))
             end
     end,
-    ServerHeader = "MochiWeb/1.1 WebMachine/" ++ ?WMVSN ++ " (" ++ ?QUIP ++ ")",
+    case application:get_env(webmachine, server_name) of
+      undefined -> ServerHeader = "MochiWeb/1.1 WebMachine/" ++ ?WMVSN ++ " (" ++ ?QUIP ++ ")";
+      {ok, ServerHeader} when is_list(ServerHeader) -> ok
+    end,
     WithSrv = mochiweb_headers:enter("Server", ServerHeader, Hdrs0),
     Hdrs = case mochiweb_headers:get_value("date", WithSrv) of
         undefined ->
@@ -744,17 +746,25 @@ req_cookie() -> call(req_cookie).
 parse_cookie() -> req_cookie().
 get_cookie_value(Key) ->
     {ReqCookie, NewReqState} = req_cookie(),
-    {proplists:get_value(Key, ReqCookie), NewReqState}.
+    case lists:keyfind(Key, 1, ReqCookie) of
+        false -> {undefined, NewReqState};
+        {Key, Value} -> {Value, NewReqState}
+    end.
 
 req_qs() -> call(req_qs).
 parse_qs() -> req_qs().
 get_qs_value(Key) ->
     {ReqQS, NewReqState} = req_qs(),
-    {proplists:get_value(Key, ReqQS), NewReqState}.
+    case lists:keyfind(Key, 1, ReqQS) of
+        false -> {undefined, NewReqState};
+        {Key, Value} -> {Value, NewReqState}
+    end.
 get_qs_value(Key, Default) ->
     {ReqQS, NewReqState} = req_qs(),
-    {proplists:get_value(Key, ReqQS, Default), NewReqState}.
-
+    case lists:keyfind(Key, 1, ReqQS) of
+        false -> {Default, NewReqState};
+        {Key, Value} -> {Value, NewReqState}
+    end.
 set_resp_body(Body) -> call({set_resp_body, Body}).
 resp_body() -> call(resp_body).
 response_body() -> resp_body().

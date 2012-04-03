@@ -113,7 +113,10 @@ handle_error(Code, Error, Req) ->
 
 
 get_option(Option, Options) ->
-    {proplists:get_value(Option, Options), proplists:delete(Option, Options)}.
+    case lists:keytake(Option, 1, Options) of
+       false -> {undefined, Options};
+       {value, {Option, Value}, NewOptions} -> {Value, NewOptions}
+    end.
 
 application_set_unless_env(App, Var, Value) ->
     Current = application:get_all_env(App),
