@@ -25,7 +25,9 @@
 -export([start_link/0,
          add_route/1,
          remove_route/1,
-         remove_resource/1]).
+         remove_resource/1,
+         get_routes/0,
+         init_routes/1]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -81,22 +83,43 @@ remove_route(Route) ->
 remove_resource(Resource) when is_atom(Resource) ->
     gen_server:call(?SERVER, {remove_resource, Resource}, infinity).
 
+%% @spec get_routes() -> [{[], res, []}]
+%% @doc Retrieve a list of routes and resources set in webmachine's
+%%      route table.
+get_routes() ->
+    get_dispatch_list().
+
+%% @spec init_routes() -> ok
+%% @doc Set the default routes, unless the routing table isn't empty.
+init_routes(DefaultRoutes) ->
+    gen_server:call(?SERVER, {init_routes, DefaultRoutes}, infinity).
+
 %% @spec start_link() -> {ok, pid()} | {error, any()}
 %% @doc Starts the webmachine_router gen_server.
 start_link() ->
-  gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    %% We expect to only be called from webmachine_sup
+    %%
+    %% Set up the ETS configuration table.
+    try ets:new(?MODULE, [named_table, public, set, {keypos, 1},
+                {read_concurrency, true}]) of
+        _Result ->
+            ok
+    catch
+        error:badarg ->
+            %% The table already exists, which is fine. The webmachine_router
+            %% probably crashed and this is a restart.
+            ok
+    end,
+
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 %% @private
 init([]) ->
   {ok, []}.
 
 %% @private
-handle_call(get_routes, _From, State) ->
-    {reply, get_dispatch_list(), State};
-
 handle_call({remove_resource, Resource}, _From, State) ->
-    DL = [D || D <- get_dispatch_list(),
-               filter_by_resource(D, Resource)],
+    DL = filter_by_resource(Resource, get_dispatch_list()),
     {reply, set_dispatch_list(DL), State};
 
 handle_call({remove_route, Route}, _From, State) ->
@@ -108,6 +131,11 @@ handle_call({add_route, Route}, _From, State) ->
     DL = [Route|[D || D <- get_dispatch_list(),
                       D /= Route]],
     {reply, set_dispatch_list(DL), State};
+
+handle_call({init_routes, DefaultRoutes}, _From, State) ->
+    %% if the table lacks a dispatch_list row, set it
+    ets:insert_new(?MODULE, {dispatch_list, DefaultRoutes}),
+    {reply, ok, State};
 
 handle_call(_Request, _From, State) ->
   {reply, ignore, State}.
@@ -129,25 +157,32 @@ code_change(_OldVsn, State, _Extra) ->
   {ok, State}.
 
 %% Internal functions
-filter_by_resource({_, {_, Resource, _}}, Resource) ->
-    false;
-filter_by_resource({_, {_, _, _}}, _Resource) ->
-    true;
-filter_by_resource({_, Resource, _}, Resource) ->
-    false;
-filter_by_resource({_, _, _}, _Resource) ->
-    true.
+
+%% @doc Remove any dispatch rule that directs requests to `Resource'
+filter_by_resource(Resource, Dispatch) ->
+    lists:foldr(filter_by_resource(Resource), [], Dispatch).
+
+filter_by_resource(Resource) ->
+    fun({_, R, _}, Acc) when R == Resource -> % basic dispatch
+            Acc;
+       ({_, _, R, _}, Acc) when R == Resource -> % guarded dispatch
+            Acc;
+       ({Host, Disp}, Acc) -> % host-based dispatch
+            [{Host, filter_by_resource(Resource, Disp)}|Acc];
+       (Other, Acc) -> % dispatch not mentioning this resource
+            [Other|Acc]
+    end.
 
 get_dispatch_list() ->
-    case application:get_env(webmachine, dispatch_list) of
-        {ok, Dispatch} ->
+    case ets:lookup(?MODULE, dispatch_list) of
+        [{dispatch_list, Dispatch}] ->
             Dispatch;
-        undefined ->
+        [] ->
             []
     end.
 
 set_dispatch_list(DispatchList) ->
-    ok = application:set_env(webmachine, dispatch_list, DispatchList),
+    true = ets:insert(?MODULE, {dispatch_list, DispatchList}),
     ok.
 
 %%
@@ -156,17 +191,9 @@ set_dispatch_list(DispatchList) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-%% For unit tests only
-start() ->
-    gen_server:start({local, ?SERVER}, ?MODULE, [], []).
-
-get_routes() ->
-    gen_server:call(?SERVER, get_routes, infinity).
-
-
 add_remove_route_test() ->
-    application:set_env(webmachine, dispatch_list, []),
-    {ok, Pid} = start(),
+    {ok, Pid} = webmachine_sup:start_link(),
+    unlink(Pid),
     PathSpec = {["foo"], foo, []},
     webmachine_router:add_route(PathSpec),
     [PathSpec] = get_routes(),
@@ -175,24 +202,54 @@ add_remove_route_test() ->
     exit(Pid, kill).
 
 add_remove_resource_test() ->
-    application:set_env(webmachine, dispatch_list, []),
-    {ok, Pid} = start(),
+    {ok, Pid} = webmachine_sup:start_link(),
+    unlink(Pid),
     PathSpec1 = {["foo"], foo, []},
     PathSpec2 = {["bar"], foo, []},
     PathSpec3 = {["baz"], bar, []},
+    PathSpec4 = {["foo"], fun(_) -> true end, foo, []},
+    PathSpec5 = {["foo"], {webmachine_router, test_guard}, foo, []},
     webmachine_router:add_route(PathSpec1),
     webmachine_router:add_route(PathSpec2),
     webmachine_router:add_route(PathSpec3),
     webmachine_router:remove_resource(foo),
     [PathSpec3] = get_routes(),
+    webmachine_router:add_route(PathSpec4),
+    webmachine_router:remove_resource(foo),
+    [PathSpec3] = get_routes(),
+    webmachine_router:add_route(PathSpec5),
+    webmachine_router:remove_resource(foo),
+    [PathSpec3] = get_routes(),
+    webmachine_router:remove_route(PathSpec3),
+    [begin
+         PathSpec = {"localhost", [HostPath]},
+         webmachine_router:add_route(PathSpec),
+         webmachine_router:remove_resource(foo),
+         [{"localhost", []}] = get_routes(),
+         webmachine_router:remove_route({"localhost", []})
+     end || HostPath <- [PathSpec1, PathSpec4, PathSpec5]],
     exit(Pid, kill).
 
 no_dupe_path_test() ->
-    application:set_env(webmachine, dispatch_list, []),
-    {ok, Pid} = start(),
+    {ok, Pid} = webmachine_sup:start_link(),
+    unlink(Pid),
     PathSpec = {["foo"], foo, []},
     webmachine_router:add_route(PathSpec),
     webmachine_router:add_route(PathSpec),
+    [PathSpec] = get_routes(),
+    exit(Pid, kill).
+
+supervisor_restart_keeps_routes_test() ->
+    {ok, Pid} = webmachine_sup:start_link(),
+    unlink(Pid),
+    PathSpec = {["foo"], foo, []},
+    webmachine_router:add_route(PathSpec),
+    [PathSpec] = get_routes(),
+    OldRouter = whereis(webmachine_router),
+    exit(whereis(webmachine_router), kill),
+    timer:sleep(100),
+    NewRouter = whereis(webmachine_router),
+    ?assert(OldRouter /= NewRouter),
     [PathSpec] = get_routes(),
     exit(Pid, kill).
 
