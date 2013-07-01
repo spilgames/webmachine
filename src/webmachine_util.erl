@@ -27,6 +27,7 @@
 -export([media_type_to_detail/1,
          quoted_string/1,
          split_quoted_strings/1]).
+-export([parse_range/2]).
 
 -ifdef(TEST).
 -ifdef(EQC).
@@ -77,6 +78,8 @@ guess_mime(File) ->
             "image/jpeg";
         ".js" ->
             "application/x-javascript";
+        ".less" ->
+            "text/css";
         ".m4v" ->
             "video/mp4";
         ".manifest" ->
@@ -365,10 +368,29 @@ unescape_quoted_string([Char | Rest], Acc) ->
 
 %% @doc  Compute the difference between two now() tuples, in milliseconds.
 %% @spec now_diff_milliseconds(now(), now()) -> integer()
+now_diff_milliseconds(undefined, undefined) ->
+    0;
+now_diff_milliseconds(undefined, T2) ->
+    now_diff_milliseconds(os:timestamp(), T2);
 now_diff_milliseconds({M,S,U}, {M,S1,U1}) ->
     ((S-S1) * 1000) + ((U-U1) div 1000);
 now_diff_milliseconds({M,S,U}, {M1,S1,U1}) ->
     ((M-M1)*1000000+(S-S1))*1000 + ((U-U1) div 1000).
+
+-spec parse_range(RawRange::string(), ResourceLength::non_neg_integer()) ->
+                         [{Start::non_neg_integer(), End::non_neg_integer()}].
+parse_range(RawRange, ResourceLength) when is_list(RawRange) ->
+    parse_range(mochiweb_http:parse_range_request(RawRange), ResourceLength, []).
+
+parse_range([], _ResourceLength, Acc) ->
+    lists:reverse(Acc);
+parse_range([Spec | Rest], ResourceLength, Acc) ->
+    case mochiweb_http:range_skip_length(Spec, ResourceLength) of
+        invalid_range ->
+            parse_range(Rest, ResourceLength, Acc);
+        {Skip, Length} ->
+            parse_range(Rest, ResourceLength, [{Skip, Skip + Length - 1} | Acc])
+    end.
 
 %%
 %% TEST

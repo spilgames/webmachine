@@ -100,8 +100,8 @@
 -include("wm_reqstate.hrl").
 -include("wm_reqdata.hrl").
 
--define(WMVSN, "1.9.2").
--define(QUIP, "someone had painted it blue").
+-define(WMVSN, "1.10.0").
+-define(QUIP, "never breaks eye contact").
 -define(IDLE_TIMEOUT, infinity).
 
 new(#wm_reqstate{}=ReqState) ->
@@ -202,7 +202,7 @@ call({get_resp_header, HdrName}, {?MODULE, ReqState}) ->
                 wrq:resp_headers(ReqState#wm_reqstate.reqdata)),
     {Reply, ReqState};
 call(get_path_info, {?MODULE, ReqState}) ->
-    PropList = dict:to_list(wrq:path_info(ReqState#wm_reqstate.reqdata)),
+    PropList = orddict:to_list(wrq:path_info(ReqState#wm_reqstate.reqdata)),
     {PropList, ReqState};
 call({get_path_info, Key}, {?MODULE, ReqState}) ->
     {wrq:path_info(Key, ReqState#wm_reqstate.reqdata), ReqState};
@@ -242,13 +242,15 @@ call({set_disp_path, P}, {?MODULE, ReqState}) ->
 call(do_redirect, {?MODULE, ReqState}) ->
     {ok, ReqState#wm_reqstate{
            reqdata=wrq:do_redirect(true, ReqState#wm_reqstate.reqdata)}};
-call({send_response, Code}, Req) ->
+call({send_response, Code}, Req) when is_integer(Code) ->
+    call({send_response, {Code, undefined}}, Req);
+call({send_response, {Code, ReasonPhrase}=CodeAndReason}, Req) when is_integer(Code) ->
     {Reply, NewState} =
         case Code of
             200 ->
-                send_ok_response(Req);
+                send_ok_response(ReasonPhrase, Req);
             _ ->
-                send_response(Code, Req)
+                send_response(CodeAndReason, Req)
         end,
     LogData = NewState#wm_reqstate.log_data,
     NewLogData = LogData#wm_log_data{finish_time=now()},
@@ -266,13 +268,13 @@ call(has_resp_body, {?MODULE, ReqState}) ->
             end,
     {Reply, ReqState};
 call({get_metadata, Key}, {?MODULE, ReqState}) ->
-    Reply = case dict:find(Key, ReqState#wm_reqstate.metadata) of
+    Reply = case orddict:find(Key, ReqState#wm_reqstate.metadata) of
                 {ok, Value} -> Value;
                 error -> undefined
             end,
     {Reply, ReqState};
 call({set_metadata, Key, Value}, {?MODULE, ReqState}) ->
-    NewDict = dict:store(Key, Value, ReqState#wm_reqstate.metadata),
+    NewDict = orddict:store(Key, Value, ReqState#wm_reqstate.metadata),
     {ok, ReqState#wm_reqstate{metadata=NewDict}};
 call(path_tokens, {?MODULE, ReqState}) ->
     {wrq:path_tokens(ReqState#wm_reqstate.reqdata), ReqState};
@@ -282,7 +284,7 @@ call(req_qs, {?MODULE, ReqState}) ->
     {wrq:req_qs(ReqState#wm_reqstate.reqdata), ReqState};
 call({load_dispatch_data, PathProps, HostTokens, Port,
       PathTokens, AppRoot, DispPath}, {?MODULE, ReqState}) ->
-    PathInfo = dict:from_list(PathProps),
+    PathInfo = orddict:from_list(PathProps),
     NewState = ReqState#wm_reqstate{reqdata=wrq:load_dispatch_data(
                         PathInfo,HostTokens,Port,PathTokens,AppRoot,
                         DispPath,ReqState#wm_reqstate.reqdata)},
@@ -325,6 +327,12 @@ send_stream_body(Socket, {Data, Next}, SoFar) ->
     Size = send_chunk(Socket, Data),
     send_stream_body(Socket, Next(), Size + SoFar).
 
+send_stream_body_no_chunk(Socket, {Data, done}) ->
+    send(Socket, Data);
+send_stream_body_no_chunk(Socket, {Data, Next}) ->
+    send(Socket, Data),
+    send_stream_body_no_chunk(Socket, Next()).
+
 send_writer_body(Socket, {Encoder, Charsetter, BodyFun}) ->
     put(bytes_written, 0),
     Writer = fun(Data) ->
@@ -338,24 +346,21 @@ send_writer_body(Socket, {Encoder, Charsetter, BodyFun}) ->
 
 send_chunk(Socket, Data) ->
     Size = iolist_size(Data),
-    send(Socket, mochihex:to_hex(Size)),
-    send(Socket, <<"\r\n">>),
-    send(Socket, Data),
-    send(Socket, <<"\r\n">>),
+    send(Socket, [mochihex:to_hex(Size), <<"\r\n">>, Data, <<"\r\n">>]),
     Size.
 
-send_ok_response({?MODULE, ReqState}=Req) ->
+send_ok_response(ReasonPhrase, {?MODULE, ReqState}=Req) ->
     RD0 = ReqState#wm_reqstate.reqdata,
     {Range, State} = get_range(Req),
     case Range of
-        X when X =:= undefined; X =:= fail ->
-            send_response(200, Req);
+        X when X =:= undefined; X =:= fail; X =:= ignore ->
+            send_response({200, ReasonPhrase}, Req);
         Ranges ->
             {PartList, Size} = range_parts(RD0, Ranges),
             case PartList of
                 [] -> %% no valid ranges
                     %% could be 416, for now we'll just return 200
-                    send_response(200, Req);
+                    send_response({200, ReasonPhrase}, Req);
                 PartList ->
                     {RangeHeaders, RangeBody} =
                         parts_to_body(PartList, Size, Req),
@@ -364,7 +369,7 @@ send_ok_response({?MODULE, ReqState}=Req) ->
                     RespBodyRD = wrq:set_resp_body(
                                    RangeBody, RespHdrsRD),
                     NewState = State#wm_reqstate{reqdata=RespBodyRD},
-                    send_response(206, NewState, Req)
+                    send_response({206, ReasonPhrase}, NewState, Req)
             end
     end.
 
@@ -374,6 +379,7 @@ send_response(Code, PassedState=#wm_reqstate{reqdata=RD}, _Req) ->
     Body0 = wrq:resp_body(RD),
     {Body,Length} = case Body0 of
         {stream, StreamBody} -> {{stream, StreamBody}, chunked};
+        {known_length_stream, Size, StreamBody} -> {{known_length_stream, StreamBody}, Size};
         {stream, Size, Fun} -> {{stream, Fun(0, Size-1)}, chunked};
         {writer, WriteBody} -> {{writer, WriteBody}, chunked};
         _ -> {Body0, iolist_size([Body0])}
@@ -388,6 +394,9 @@ send_response(Code, PassedState=#wm_reqstate{reqdata=RD}, _Req) ->
             case Body of
                 {stream, Body2} ->
                     send_stream_body(PassedState#wm_reqstate.socket, Body2);
+                {known_length_stream, Body2} ->
+                    send_stream_body_no_chunk(PassedState#wm_reqstate.socket, Body2),
+                    Length;
                 {writer, Body2} ->
                     send_writer_body(PassedState#wm_reqstate.socket, Body2);
                 _ ->
@@ -512,19 +521,24 @@ read_chunk_length(Socket, MaybeLastChunk) ->
             exit(normal)
     end.
 
-get_range({?MODULE, ReqState}=Req) ->
-    case get_header_value("range", Req) of
-        {undefined, _} ->
-            {undefined, ReqState#wm_reqstate{range=undefined}};
-        {RawRange, _} ->
-            Range = parse_range_request(RawRange),
-            {Range, ReqState#wm_reqstate{range=Range}}
+get_range({?MODULE, #wm_reqstate{reqdata = RD}=ReqState}=Req) ->
+    case RD#wm_reqdata.resp_range of
+        ignore_request ->
+            {ignore, ReqState#wm_reqstate{range=undefined}};
+        follow_request ->
+            case get_header_value("range", Req) of
+                {undefined, _} ->
+                    {undefined, ReqState#wm_reqstate{range=undefined}};
+                {RawRange, _} ->
+                    Range = mochiweb_http:parse_range_request(RawRange),
+                    {Range, ReqState#wm_reqstate{range=Range}}
+            end
     end.
 
 range_parts(_RD=#wm_reqdata{resp_body={file, IoDevice}}, Ranges) ->
     Size = mochiweb_io:iodevice_size(IoDevice),
     F = fun (Spec, Acc) ->
-                case range_skip_length(Spec, Size) of
+                case mochiweb_http:range_skip_length(Spec, Size) of
                     invalid_range ->
                         Acc;
                     V ->
@@ -544,16 +558,26 @@ range_parts(RD=#wm_reqdata{resp_body={stream, {Hunk,Next}}}, Ranges) ->
     MRB = RD#wm_reqdata.max_recv_body,
     range_parts(read_whole_stream({Hunk,Next}, [], MRB, 0), Ranges);
 
+range_parts(_RD=#wm_reqdata{resp_body={known_length_stream, Size, StreamBody}},
+            Ranges) ->
+    SkipLengths = [ mochiweb_http:range_skip_length(R, Size) || R <- Ranges],
+    {[ {Skip, Skip+Length-1, {known_length_stream, Length, StreamBody}} ||
+         {Skip, Length} <- SkipLengths ],
+     Size};
+
 range_parts(_RD=#wm_reqdata{resp_body={stream, Size, StreamFun}}, Ranges) ->
-    SkipLengths = [ range_skip_length(R, Size) || R <- Ranges],
+    SkipLengths = [ mochiweb_http:range_skip_length(R, Size) || R <- Ranges],
     {[ {Skip, Skip+Length-1, StreamFun} || {Skip, Length} <- SkipLengths ],
      Size};
+
+range_parts(#wm_reqdata{resp_body=Body}, Ranges) when is_binary(Body); is_list(Body) ->
+    range_parts(Body, Ranges);
 
 range_parts(Body0, Ranges) when is_binary(Body0); is_list(Body0) ->
     Body = iolist_to_binary(Body0),
     Size = size(Body),
     F = fun(Spec, Acc) ->
-                case range_skip_length(Spec, Size) of
+                case mochiweb_http:range_skip_length(Spec, Size) of
                     invalid_range ->
                         Acc;
                     {Skip, Length} ->
@@ -564,42 +588,6 @@ range_parts(Body0, Ranges) when is_binary(Body0); is_list(Body0) ->
                 end
         end,
     {lists:foldr(F, [], Ranges), Size}.
-
-range_skip_length(Spec, Size) ->
-    case Spec of
-        {none, R} when R =< Size, R >= 0 ->
-            {Size - R, R};
-        {none, _OutOfRange} ->
-            {0, Size};
-        {R, none} when R >= 0, R < Size ->
-            {R, Size - R};
-        {_OutOfRange, none} ->
-            invalid_range;
-        {Start, End} when 0 =< Start, Start =< End, End < Size ->
-            {Start, End - Start + 1};
-        {_OutOfRange, _End} ->
-            invalid_range
-    end.
-
-parse_range_request(RawRange) when is_list(RawRange) ->
-    try
-        "bytes=" ++ RangeString = RawRange,
-        Ranges = string:tokens(RangeString, ","),
-        lists:map(fun ("-" ++ V)  ->
-                          {none, list_to_integer(V)};
-                      (R) ->
-                          case string:tokens(R, "-") of
-                              [S1, S2] ->
-                                  {list_to_integer(S1), list_to_integer(S2)};
-                              [S] ->
-                                  {list_to_integer(S), none}
-                          end
-                  end,
-                  Ranges)
-    catch
-        _:_ ->
-            fail
-    end.
 
 parts_to_body([{Start, End, Body0}], Size, Req) ->
     %% return body for a range reponse with a single body
@@ -616,9 +604,12 @@ parts_to_body([{Start, End, Body0}], Size, Req) ->
                     mochiweb_util:make_io(Start), "-",
                     mochiweb_util:make_io(End),
                     "/", mochiweb_util:make_io(Size)]}],
-    Body = if is_function(Body0) ->
-                   {stream, Body0(Start, End)};
-              true ->
+    Body = case Body0 of
+              _ when is_function(Body0) ->
+                   {known_length_stream, End - Start + 1, Body0(Start, End)};
+              {known_length_stream, ContentSize, StreamBody} ->
+                   {known_length_stream, ContentSize, StreamBody};
+              _ ->
                    Body0
            end,
     {HeaderList, Body};
@@ -699,8 +690,12 @@ stream_multipart_part_helper(Fun, Rest, CType, Boundary, Size) ->
             end
     end.
 
-make_code(X) when is_integer(X) ->
-    [integer_to_list(X), [" " | httpd_util:reason_phrase(X)]];
+make_code({Code, undefined}) when is_integer(Code) ->
+    make_code({Code, httpd_util:reason_phrase(Code)});
+make_code({Code, ReasonPhrase}) when is_integer(Code) ->
+    [integer_to_list(Code), [" ", ReasonPhrase]];
+make_code(Code) when is_integer(Code) ->
+    make_code({Code, httpd_util:reason_phrase(Code)});
 make_code(Io) when is_list(Io); is_binary(Io) ->
     Io.
 
@@ -709,7 +704,9 @@ make_version({1, 0}) ->
 make_version(_) ->
     <<"HTTP/1.1 ">>.
 
-make_headers(Code, Length, RD) ->
+make_headers({Code, _ReasonPhrase}, Length, RD) ->
+    make_headers(Code, Length, RD);
+make_headers(Code, Length, RD) when is_integer(Code) ->
     Hdrs0 = case Code of
         304 ->
             mochiweb_headers:make(wrq:resp_headers(RD));
@@ -929,7 +926,7 @@ header_test() ->
 metadata_test() ->
     Key = "webmachine",
     Value = "eunit",
-    {ok, ReqState} = set_metadata(Key, Value, #wm_reqstate{metadata=dict:new()}),
+    {ok, ReqState} = set_metadata(Key, Value, #wm_reqstate{metadata=orddict:new()}),
     ?assertEqual({Value, ReqState}, get_metadata(Key, ReqState)).
 
 peer_test() ->
