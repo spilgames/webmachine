@@ -16,7 +16,7 @@
 
 %% @doc Default log handler for webmachine
 
--module(webmachine_log_handler).
+-module(webmachine_error_log_handler).
 
 -behaviour(gen_event).
 
@@ -36,7 +36,7 @@
 
 -record(state, {hourstamp, filename, handle}).
 
--define(FILENAME, "access.log").
+-define(FILENAME, "wm_error.log").
 
 %% ===================================================================
 %% gen_event callbacks
@@ -58,10 +58,22 @@ handle_call(_Request, State) ->
     {ok, ok, State}.
 
 %% @private
-handle_event({log_access, LogData}, State) ->
+handle_event({log_error, Msg}, State) ->
     NewState = webmachine_log:maybe_rotate(?MODULE, os:timestamp(), State),
-    Msg = format_req(LogData),
+    FormattedMsg = format_req(error, undefined, undefined, Msg),
+    webmachine_log:log_write(NewState#state.handle, FormattedMsg),
+    {ok, NewState};
+handle_event({log_error, Code, _Req, _Reason}, State) when Code < 500 ->
+    {ok, State};
+handle_event({log_error, Code, Req, Reason}, State) ->
+    NewState = webmachine_log:maybe_rotate(?MODULE, os:timestamp(), State),
+    Msg = format_req(error, Code, Req, Reason),
     webmachine_log:log_write(NewState#state.handle, Msg),
+    {ok, NewState};
+handle_event({log_info, Msg}, State) ->
+    NewState = webmachine_log:maybe_rotate(?MODULE, os:timestamp(), State),
+    FormattedMsg = format_req(info, undefined, undefined, Msg),
+    webmachine_log:log_write(NewState#state.handle, FormattedMsg),
     {ok, NewState};
 handle_event(_Event, State) ->
     {ok, State}.
@@ -82,40 +94,21 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal functions
 %% ===================================================================
 
-format_req(#wm_log_data{method=Method,
-                        headers=Headers,
-                        peer=Peer,
-                        path=Path,
-                        version=Version,
-                        response_code=ResponseCode,
-                        response_length=ResponseLength}) ->
-    User = "-",
-    Time = webmachine_log:fmtnow(),
-    Status = case ResponseCode of
-                 {Code, _ReasonPhrase} when is_integer(Code)  ->
-                     integer_to_list(Code);
-                 _ when is_integer(ResponseCode) ->
-                     integer_to_list(ResponseCode);
-                 _ ->
-                     ResponseCode
-             end,
-    Length = integer_to_list(ResponseLength),
-    Referer =
-        case mochiweb_headers:get_value("Referer", Headers) of
-            undefined -> "";
-            R -> R
-        end,
-    UserAgent =
-        case mochiweb_headers:get_value("User-Agent", Headers) of
-            undefined -> "";
-            U -> U
-        end,
-    fmt_alog(Time, Peer, User, atom_to_list(Method), Path, Version,
-             Status, Length, Referer, UserAgent).
+format_req(info, undefined, _, Msg) ->
+    ["[info] ", Msg];
+format_req(error, undefined, _, Msg) ->
+    ["[error] ", Msg];
+format_req(error, 501, Req, _) ->
+    {Path, _} = Req:path(),
+    {Method, _} = Req:method(),
+    Reason = "Webmachine does not support method ",
+    ["[error] ", Reason, Method, ": path=", Path, $\n];
+format_req(error, 503, Req, _) ->
+    {Path, _} = Req:path(),
+    Reason = "Webmachine cannot fulfill the request at this time",
+    ["[error] ", Reason, ": path=", Path, $\n];
+format_req(error, _Code, Req, Reason) ->
+    {Path, _} = Req:path(),
+    Str = io_lib:format("~p", [Reason]),
+    ["[error] path=", Path, $\x20, Str, $\n].
 
-fmt_alog(Time, Ip, User, Method, Path, {VM,Vm},
-         Status,  Length, Referrer, UserAgent) ->
-    [webmachine_log:fmt_ip(Ip), " - ", User, [$\s], Time, [$\s, $"], Method, " ", Path,
-     " HTTP/", integer_to_list(VM), ".", integer_to_list(Vm), [$",$\s],
-     Status, [$\s], Length, [$\s,$"], Referrer,
-     [$",$\s,$"], UserAgent, [$",$\n]].

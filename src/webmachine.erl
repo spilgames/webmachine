@@ -56,18 +56,22 @@ new_request(mochiweb, Request) ->
                           reqdata=wrq:create(Method,Scheme,Version,RawPath,Headers)},
 
     InitReq = {webmachine_request,InitState},
-    {Peer, ReqState} = InitReq:get_peer(),
-    PeerState = ReqState#wm_reqstate{reqdata=wrq:set_peer(Peer,
-                                              ReqState#wm_reqstate.reqdata)},
-    LogData = #wm_log_data{start_time=now(),
+    {Peer, _ReqState} = InitReq:get_peer(),
+    {Sock, ReqState} = InitReq:get_sock(),
+    ReqData = wrq:set_sock(Sock,
+                           wrq:set_peer(Peer,
+                                        ReqState#wm_reqstate.reqdata)),
+    LogData = #wm_log_data{start_time=os:timestamp(),
                            method=Method,
                            headers=Headers,
-                           peer=PeerState#wm_reqstate.peer,
+                           peer=Peer,
+                           sock=Sock,
                            path=RawPath,
                            version=Version,
                            response_code=404,
                            response_length=0},
-    webmachine_request:new(PeerState#wm_reqstate{log_data=LogData}).
+    webmachine_request:new(ReqState#wm_reqstate{log_data=LogData,
+                                                reqdata=ReqData}).
 
 do_rewrite(RewriteMod, Method, Scheme, Version, Headers, RawPath) ->
     case RewriteMod:rewrite(Method, Scheme, Version, Headers, RawPath) of
@@ -77,3 +81,21 @@ do_rewrite(RewriteMod, Method, Scheme, Version, Headers, RawPath) ->
         %% headers and raw path rewritten (new style rewriting)
         {NewHeaders, NewPath} -> {NewHeaders,NewPath}
     end.
+
+%%
+%% TEST
+%%
+-ifdef(TEST).
+
+-include_lib("eunit/include/eunit.hrl").
+
+start_stop_test() ->
+    application:start(inets),
+    application:start(mochiweb),
+    ?assertEqual(ok, webmachine:start()),
+    ?assertEqual(ok, webmachine:stop()),
+    application:stop(mochiweb),
+    application:stop(inets),
+    ok.
+
+-endif.
