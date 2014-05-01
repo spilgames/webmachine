@@ -63,7 +63,7 @@ respond(Code) when is_integer(Code) ->
     respond({Code, undefined});
 respond({_, _}=CodeAndPhrase) ->
     Resource = get(resource),
-    EndTime = now(),
+    EndTime = os:timestamp(),
     respond(CodeAndPhrase, Resource, EndTime).
 
 respond({Code, _ReasonPhrase}=CodeAndPhrase, Resource, EndTime)
@@ -79,8 +79,7 @@ respond({304, _ReasonPhrase}=CodeAndPhrase, Resource, EndTime) ->
         undefined -> nop;
         Exp ->
             wrcall({set_resp_header, "Expires",
-                    httpd_util:rfc1123_date(
-                      calendar:universal_time_to_local_time(Exp))})
+                    webmachine_util:rfc1123_date(Exp)})
     end,
     finish_response(CodeAndPhrase, Resource, EndTime);
 respond(CodeAndPhrase, Resource, EndTime) ->
@@ -105,7 +104,7 @@ error_response(Reason) ->
 
 error_response(Code, Reason) ->
     Resource = get(resource),
-    EndTime = now(),
+    EndTime = os:timestamp(),
     error_response({Code, undefined}, Reason, Resource, EndTime).
 
 error_response({Code, _}=CodeAndPhrase, Resource, EndTime) ->
@@ -119,7 +118,7 @@ error_response({Code, _}=CodeAndPhrase, Reason, Resource, EndTime) ->
     {ErrorHTML, ReqState} = ErrorHandler:render_error(
                               Code, {webmachine_request,get(reqstate)}, Reason),
     put(reqstate, ReqState),
-    wrcall({set_resp_body, ErrorHTML}),
+    wrcall({set_resp_body, encode_body(ErrorHTML)}),
     finish_response(CodeAndPhrase, Resource, EndTime).
 
 decision_test(Test,TestVal,TrueFlow,FalseFlow) ->
@@ -546,15 +545,13 @@ decision(v3o18) ->
                 undefined -> nop;
                 LM ->
                     wrcall({set_resp_header, "Last-Modified",
-                           httpd_util:rfc1123_date(
-                             calendar:universal_time_to_local_time(LM))})
+                            webmachine_util:rfc1123_date(LM)})
             end,
             case resource_call(expires) of
                 undefined -> nop;
                 Exp ->
                     wrcall({set_resp_header, "Expires",
-                           httpd_util:rfc1123_date(
-                              calendar:universal_time_to_local_time(Exp))})
+                            webmachine_util:rfc1123_date(Exp)})
             end,
             F = hd([Fun || {Type,Fun} <- resource_call(content_types_provided),
                            CT =:= webmachine_util:format_content_type(Type)]),
@@ -634,11 +631,23 @@ encode_body(Body) ->
     Charsetter =
     case resource_call(charsets_provided) of
         no_charset -> fun(X) -> X end;
-        CP -> hd([Fun || {CSet,Fun} <- CP, ChosenCSet =:= CSet])
+        CP ->
+            case [Fun || {CSet,Fun} <- CP, ChosenCSet =:= CSet] of
+                [] ->
+                    fun(X) -> X end;
+                [F | _] ->
+                    F
+            end
     end,
     ChosenEnc = wrcall({get_metadata, 'content-encoding'}),
-    Encoder = hd([Fun || {Enc,Fun} <- resource_call(encodings_provided),
-                         ChosenEnc =:= Enc]),
+    Encoder =
+        case [Fun || {Enc,Fun} <- resource_call(encodings_provided),
+                     ChosenEnc =:= Enc] of
+            [] ->
+                fun(X) -> X end;
+            [E | _] ->
+                E
+        end,
     case Body of
         {stream, StreamBody} ->
             {stream, make_encoder_stream(Encoder, Charsetter, StreamBody)};
@@ -725,24 +734,51 @@ variances() ->
     end,
     Accept ++ AcceptEncoding ++ AcceptCharset ++ resource_call(variances).
 
+-ifndef(old_hash).
+md5(Bin) ->
+    crypto:hash(md5, Bin).
+
+md5_init() ->
+    crypto:hash_init(md5).
+
+md5_update(Ctx, Bin) ->
+    crypto:hash_update(Ctx, Bin).
+
+md5_final(Ctx) ->
+    crypto:hash_final(Ctx).
+-else.
+md5(Bin) ->
+    crypto:md5(Bin).
+
+md5_init() ->
+    crypto:md5_init().
+
+md5_update(Ctx, Bin) ->
+    crypto:md5_update(Ctx, Bin).
+
+md5_final(Ctx) ->
+    crypto:md5_final(Ctx).
+-endif.
+
+
 compute_body_md5() ->
     case wrcall({req_body, 52428800}) of
         stream_conflict ->
             compute_body_md5_stream();
         Body ->
-            crypto:md5(Body)
+            md5(Body)
     end.
 
 compute_body_md5_stream() ->
-    MD5Ctx = crypto:md5_init(),
+    MD5Ctx = md5_init(),
     compute_body_md5_stream(MD5Ctx, wrcall({stream_req_body, 8192}), <<>>).
 
 compute_body_md5_stream(MD5, {Hunk, done}, Body) ->
     %% Save the body so it can be retrieved later
     put(reqstate, wrq:set_resp_body(Body, get(reqstate))),
-    crypto:md5_final(crypto:md5_update(MD5, Hunk));
+    md5_final(md5_update(MD5, Hunk));
 compute_body_md5_stream(MD5, {Hunk, Next}, Body) ->
-    compute_body_md5_stream(crypto:md5_update(MD5, Hunk), Next(), <<Body/binary, Hunk/binary>>).
+    compute_body_md5_stream(md5_update(MD5, Hunk), Next(), <<Body/binary, Hunk/binary>>).
 
 maybe_flush_body_stream() ->
     maybe_flush_body_stream(wrcall({stream_req_body, 8192})).
